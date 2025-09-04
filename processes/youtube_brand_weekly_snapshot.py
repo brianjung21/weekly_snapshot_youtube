@@ -27,7 +27,7 @@ from typing import Dict, List, Iterable
 import requests
 import pandas as pd
 
-API_KEY = "AIzaSyCYDdffhCEKauoHtuWDyE5TpC5wmojvrY4"
+API_KEY = "PASS_API_KEY_HERE"
 
 KEYWORDS_PATH = Path("fnb_keywords_sample.csv")
 WEEKLY_BRAND_OUT = Path("snapshot_data/youtube_brand_weekly_snapshot4.csv")
