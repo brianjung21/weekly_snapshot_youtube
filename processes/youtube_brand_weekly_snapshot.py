@@ -27,14 +27,86 @@ from typing import Dict, List, Iterable
 import requests
 import pandas as pd
 
-API_KEY = "PASS_API_KEY_HERE"
+# Support multiple API keys with automatic rotation on quota/429/403
+API_KEYS = [
+    "AIzaSyB0jnjPnNadFwHgVBSjlJC983NyxYCAcjc",
+    "AIzaSyCYDdffhCEKauoHtuWDyE5TpC5wmojvrY4",
+    "AIzaSyAKEelsmM7wunFoazhtVq68y9VV0N7N1iI",
+    "AIzaSyA0ygat1NZ0isS8gwFuUECw5P6kAhU3D8Y",
+    "AIzaSyA3QqHNmeSGBcqKyKAj3CGqSHpjR2HY-i0",
+    "AIzaSyA49b5OwvfWpqSef_9FKsJ91npFszvVGjM",  # add more keys here, e.g., "KEY_2", "KEY_3", ...
+]
 
+class KeyRing:
+    def __init__(self, keys):
+        ks = [k for k in (keys or []) if k]
+        if not ks:
+            raise ValueError("No API keys provided in API_KEYS")
+        self.keys = ks
+        self.i = 0
+
+    @property
+    def current(self):
+        return self.keys[self.i]
+
+    def advance(self):
+        self.i = (self.i + 1) % len(self.keys)
+        return self.current
+
+    def inject(self, params: dict) -> dict:
+        # return a shallow-copied params dict with 'key' set to the current key
+        p = dict(params or {})
+        p["key"] = self.current
+        return p
+
+KEYRING = KeyRing(API_KEYS)
+
+# ===== Range mode (optional): run many consecutive weeks and resume from checkpoint =====
+RUN_RANGE = True  # set True to iterate weeks; False keeps single-week mode
+RANGE_START_UTC = '2025-08-29'  # inclusive week starts from here
+RANGE_END_UTC   = '2025-09-16'  # target horizon; weeks will be stepped by 7 days up to this date
+
+from pathlib import Path
 KEYWORDS_PATH = Path("fnb_keywords_sample.csv")
-WEEKLY_BRAND_OUT = Path("snapshot_data/youtube_brand_weekly_snapshot4.csv")
-WEEKLY_CHANNEL_OUT = Path("snapshot_data/youtube_brand_channel_weekly_snapshot4.csv")
+
+CHECKPOINT_PATH = Path('snapshot_data/weekly_snapshot_checkpoint.json')
+
+# Point outputs to the consolidated "ALL" files so history accumulates in one place
+WEEKLY_BRAND_OUT = Path('snapshot_data/youtube_brand_weekly_snapshot_ALL.csv')
+WEEKLY_CHANNEL_OUT = Path('snapshot_data/youtube_brand_channel_weekly_snapshot_ALL.csv')
 
 WEEK_START_UTC = '2025-08-22'
 WEEK_END_UTC = '2025-08-28'
+import json
+
+def save_ckpt(week_start: str, week_end: str, brand_idx: int):
+    try:
+        CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CHECKPOINT_PATH.open('w', encoding='utf-8') as f:
+            json.dump({
+                'week_start': week_start,
+                'week_end': week_end,
+                'brand_idx': int(brand_idx),
+                'ts_utc': datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+            }, f)
+    except Exception as e:
+        print(f"[ckpt] failed to save checkpoint: {e}")
+
+def load_ckpt():
+    try:
+        if CHECKPOINT_PATH.exists():
+            with CHECKPOINT_PATH.open('r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[ckpt] failed to load checkpoint: {e}")
+    return None
+
+def clear_ckpt():
+    try:
+        if CHECKPOINT_PATH.exists():
+            CHECKPOINT_PATH.unlink()
+    except Exception as e:
+        print(f"[ckpt] failed to clear checkpoint: {e}")
 
 
 def ensure_seven_day_window(start_str: str, end_str: str):
@@ -129,6 +201,39 @@ def get_json(url: str, params: dict) -> dict:
                 continue
             raise
 
+def get_json_with_keys(url: str, params: dict) -> dict:
+    """GET JSON with exponential backoff, auto-rotating API keys on 403/429.
+    Tries each key in KEYRING at most once per attempt horizon, backing off between rounds.
+    """
+    last_exc = None
+    # Try up to MAX_RETRIES rounds; within each round we may cycle keys
+    for attempt in range(MAX_RETRIES):
+        # try as many keys as we have before backing off
+        for _ in range(len(KEYRING.keys)):
+            try:
+                p = KEYRING.inject(params)
+                resp = requests.get(url, params=p, timeout=30)
+                if resp.status_code in (429, 403, 500, 502, 503, 504):
+                    # rotate key on 429/403 immediately; for 5xx we'll backoff as well
+                    last_exc = requests.HTTPError(f"status={resp.status_code} body={resp.text[:200]}")
+                    if resp.status_code in (429, 403):
+                        KEYRING.advance()
+                        continue
+                    # for 5xx, fall through to backoff after key cycle
+                resp.raise_for_status()
+                return resp.json()
+            except requests.RequestException as e:
+                last_exc = e
+                # rotate key and try next key
+                KEYRING.advance()
+                continue
+        # after trying all keys once, back off and retry
+        _sleep_backoff(attempt)
+    # exhausted all retries/keys
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("get_json_with_keys failed with no exception context")
+
 
 def yt_videos_details(video_ids: List[str]) -> dict:
     out = {}
@@ -137,12 +242,11 @@ def yt_videos_details(video_ids: List[str]) -> dict:
     for i in range(0, len(video_ids), 50):
         chunk = video_ids[i:i+50]
         params = {
-            "key": API_KEY,
             "part": "snippet,statistics",
             "id": ",".join(chunk),
-            "maxResults": 50
+            "maxResults": 50,
         }
-        data = get_json(f"{BASE}/videos", params)
+        data = get_json_with_keys(f"{BASE}/videos", params)
         for it in data.get("items", []):
             vid = it.get("id")
             sn = it.get("snippet", {}) or {}
@@ -165,12 +269,11 @@ def yt_channels_stats(channel_ids: List[str]) -> dict:
     for i in range(0, len(channel_ids), 50):
         chunk = channel_ids[i:i+50]
         params = {
-            "key": API_KEY,
             "part": "statistics",
             "id": ",".join(chunk),
-            "maxResults": 50
+            "maxResults": 50,
         }
-        data = get_json(f"{BASE}/channels", params)
+        data = get_json_with_keys(f"{BASE}/channels", params)
         for it in data.get("items", []):
             cid = it.get("id")
             st = it.get("statistics", {}) or {}
@@ -183,7 +286,6 @@ def yt_channels_stats(channel_ids: List[str]) -> dict:
 
 def yt_search_pages(q: str, published_after: str, published_before: str) -> Iterable[dict]:
     params = {
-        'key': API_KEY,
         "part": "snippet",
         "q": q,
         "type": "video",
@@ -193,15 +295,15 @@ def yt_search_pages(q: str, published_after: str, published_before: str) -> Iter
         "publishedBefore": published_before,
     }
     if REGION_CODE:
-        params['regionCode'] = REGION_CODE
+        params["regionCode"] = REGION_CODE
     if RELEVANCE_LANGUAGE:
-        params['relevanceLanguage'] = RELEVANCE_LANGUAGE
+        params["relevanceLanguage"] = RELEVANCE_LANGUAGE
 
     token = None
     while True:
         if token:
             params['pageToken'] = token
-        data = get_json(f"{BASE}/search", params)
+        data = get_json_with_keys(f"{BASE}/search", params)
         for it in data.get("items", []):
             yield it
         token = data.get("nextPageToken")
@@ -218,41 +320,56 @@ def weekly_window_utc(week_start: str, week_end: str):
     return after, before, start_dt.date().isoformat(), end_dt_inclusive.date().isoformat()
 
 
-def main():
+
+def run_one_week(ws: str, we: str, resume_brand_idx: int = 0):
     kw_map = load_keywords(KEYWORDS_PATH)
     if not kw_map:
         print("No keywords found.")
         return
 
-    ws, we = ensure_seven_day_window(WEEK_START_UTC, WEEK_END_UTC)
+    ws, we = ensure_seven_day_window(ws, we)
     published_after, published_before, week_start, week_end = weekly_window_utc(ws, we)
+    print(f"[RUN] Week {week_start} → {week_end} (UTC)")
 
     patterns = {k: [brand_to_pattern(v) for v in vs] for k, vs in kw_map.items()}
-
     brand_api_ids = {k: set() for k in kw_map.keys()}
 
     rows = []
-    for main_kw in kw_map.keys():
-        print(f"[YouTube SNAPSHOT] {main_kw} | {week_start}–{week_end} (UTC, 7 days)")
+    keys_list = list(kw_map.keys())
+    for bi, main_kw in enumerate(keys_list):
+        if bi < resume_brand_idx:
+            continue
+        print(f"[YouTube SNAPSHOT] {main_kw} | {week_start}–{week_end}")
         pats = patterns[main_kw]
         matched = 0
 
         video_ids = []
         hits = []
-        for item in yt_search_pages(main_kw, published_after, published_before):
-            vid = item['id']['videoId']
-            snip = item.get('snippet', {})
-            hits.append({
-                'video_id': vid,
-                'title': snip.get('title', ''),
-                'description': snip.get('description', ''),
-                'channel': snip.get('channelTitle', ''),
-                'published_at': snip.get('publishedAt', ''),
-            })
-            video_ids.append(vid)
-            brand_api_ids[main_kw].add(vid)
+        try:
+            for item in yt_search_pages(main_kw, published_after, published_before):
+                vid = item['id']['videoId']
+                snip = item.get('snippet', {})
+                hits.append({
+                    'video_id': vid,
+                    'title': snip.get('title', ''),
+                    'description': snip.get('description', ''),
+                    'channel': snip.get('channelTitle', ''),
+                    'published_at': snip.get('publishedAt', ''),
+                })
+                video_ids.append(vid)
+                brand_api_ids[main_kw].add(vid)
+        except Exception as e:
+            print(f"[error] search failed for {main_kw}: {e}")
+            save_ckpt(week_start, week_end, bi)
+            raise
 
-        id2det = yt_videos_details(video_ids) if video_ids else {}
+        details_fetched_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        try:
+            id2det = yt_videos_details(video_ids) if video_ids else {}
+        except Exception as e:
+            print(f"[error] videos.details failed for {main_kw}: {e}")
+            save_ckpt(week_start, week_end, bi)
+            raise
 
         for h in hits:
             det = id2det.get(h['video_id'], {})
@@ -270,8 +387,12 @@ def main():
                 })
                 matched += 1
         print(f"    -> {matched} videos matched")
+
+        # Save checkpoint to resume at next brand on any subsequent run
+        save_ckpt(week_start, week_end, bi + 1)
         time.sleep(BRAND_SLEEP_SEC)
 
+    # --- aggregation & writes (same as before) ---
     if rows:
         df = pd.DataFrame(rows).drop_duplicates(subset=['keyword', 'video_id'])
         per_ch_week = (df.groupby(['keyword', 'channel', 'channel_id'], as_index=False)
@@ -281,8 +402,7 @@ def main():
             "likeCount": "sum",
             "commentCount": "sum"
         })
-        .rename(columns={"video_id": "matched_videos",
-                         "viewCount": "views"}))
+        .rename(columns={"video_id": "matched_videos", "viewCount": "views"}))
 
         unique_channel_ids = sorted(c for c in per_ch_week['channel_id'].unique().tolist() if c)
         cid2stats = yt_channels_stats(unique_channel_ids)
@@ -313,7 +433,14 @@ def main():
             'weekly_likes': 0,
             'weekly_comments': 0,
         })
-        # Note: weekly_video_mentions represents text-confirmed matches; weekly_api_hits is pre-filter unique videos.
+
+        # Averages
+        bw = brand_week.copy()
+        n = (bw["weekly_video_mentions"].replace({0: pd.NA})).astype("Int64")
+        bw["avg_views_per_video"] = (bw["weekly_views"] / n).astype(float).fillna(0.0)
+        bw["avg_likes_per_video"] = (bw["weekly_likes"] / n).astype(float).fillna(0.0)
+        bw["avg_comments_per_video"] = (bw["weekly_comments"] / n).astype(float).fillna(0.0)
+        brand_week = bw
 
         def pick_top_channels(g: pd.DataFrame) -> str:
             tmp = g.copy()
@@ -328,6 +455,10 @@ def main():
                 .apply(lambda g: pd.Series({"top_channels_week": pick_top_channels(g)}))
                 .reset_index(drop=True))
         out = brand_week.merge(tops, on='keyword', how='left')
+
+        details_fetched_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        out["as_of_details_fetched_utc"] = details_fetched_ts
+        per_ch_week["as_of_details_fetched_utc"] = details_fetched_ts
     else:
         out = (pd.DataFrame({'keyword': sorted(load_keywords(KEYWORDS_PATH).keys())})
                .assign(weekly_api_hits=0,
@@ -335,15 +466,20 @@ def main():
                        weekly_views=0,
                        weekly_likes=0,
                        weekly_comments=0,
+                       avg_views_per_video=0.0,
+                       avg_likes_per_video=0.0,
+                       avg_comments_per_video=0.0,
                        top_channels_week=""))
         per_ch_week = pd.DataFrame(columns=[
             "keyword", "channel", "channel_id", "matched_videos", "views",
             "likeCount", "commentCount", "subscribers", "channel_video_count"
         ])
+        details_fetched_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        out["as_of_details_fetched_utc"] = details_fetched_ts
+        per_ch_week["as_of_details_fetched_utc"] = details_fetched_ts
 
     out.insert(0, "week_start", week_start)
     out.insert(1, "week_end", week_end)
-
     per_ch_week.insert(0, "week_start", week_start)
     per_ch_week.insert(1, "week_end", week_end)
     per_ch_week["engagement"] = per_ch_week["likeCount"].astype(int) + per_ch_week["commentCount"].astype(int)
@@ -366,6 +502,40 @@ def main():
 
     print(f"Wrote weekly brand snapshot -> {WEEKLY_BRAND_OUT.resolve()}")
     print(f"Wrote weekly channel snapshot -> {WEEKLY_CHANNEL_OUT.resolve()}")
+
+    # clear checkpoint after successful write for this week
+    clear_ckpt()
+
+
+def main():
+    if RUN_RANGE:
+        # Try resume from checkpoint first
+        ck = load_ckpt()
+        if ck:
+            print(f"[ckpt] Resuming week {ck['week_start']} → {ck['week_end']} at brand_idx={ck['brand_idx']}")
+            try:
+                run_one_week(ck['week_start'], ck['week_end'], resume_brand_idx=int(ck.get('brand_idx', 0)))
+                # advance to next week after successful resume
+                start_dt = datetime.fromisoformat(ck['week_start']).date() + timedelta(days=7)
+            except Exception:
+                return  # leave checkpoint for the next run
+        else:
+            start_dt = datetime.fromisoformat(RANGE_START_UTC).date()
+
+        end_horizon = datetime.fromisoformat(RANGE_END_UTC).date()
+        while start_dt <= end_horizon:
+            ws = start_dt.isoformat()
+            we = (start_dt + timedelta(days=6)).isoformat()
+            save_ckpt(ws, we, 0)  # set checkpoint at the start of the week
+            try:
+                run_one_week(ws, we, resume_brand_idx=0)
+            except Exception as e:
+                print(f"[halt] Stopping due to error/quota. Checkpoint saved for {ws} → {we}. Error: {e}")
+                return
+            start_dt = start_dt + timedelta(days=7)
+        print("[done] Range complete.")
+    else:
+        run_one_week(WEEK_START_UTC, WEEK_END_UTC, resume_brand_idx=0)
 
 
 if __name__ == "__main__":
