@@ -29,12 +29,7 @@ import pandas as pd
 
 # Support multiple API keys with automatic rotation on quota/429/403
 API_KEYS = [
-    "AIzaSyB0jnjPnNadFwHgVBSjlJC983NyxYCAcjc",
-    "AIzaSyCYDdffhCEKauoHtuWDyE5TpC5wmojvrY4",
-    "AIzaSyAKEelsmM7wunFoazhtVq68y9VV0N7N1iI",
-    "AIzaSyA0ygat1NZ0isS8gwFuUECw5P6kAhU3D8Y",
-    "AIzaSyA3QqHNmeSGBcqKyKAj3CGqSHpjR2HY-i0",
-    "AIzaSyA49b5OwvfWpqSef_9FKsJ91npFszvVGjM",  # add more keys here, e.g., "KEY_2", "KEY_3", ...
+ # add more keys here, e.g., "KEY_2", "KEY_3", ...
 ]
 
 class KeyRing:
